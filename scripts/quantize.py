@@ -32,7 +32,6 @@ def quantize(input_path: str, output_dir: str):
         model_input=str(input_file),
         model_output=str(output_file),
         weight_type=QuantType.QInt8,
-        optimize_model=True,
     )
 
     print(f"Quantization complete: {output_file}")
