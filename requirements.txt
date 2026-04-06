@@ -1,6 +1,7 @@
 torch>=2.0.0
 transformers>=4.40.0
 onnx>=1.16.0
+onnxscript>=0.1.0
 onnxruntime>=1.18.0
 onnxruntime-tools>=1.7.0
 optimum[onnxruntime]>=1.19.0
