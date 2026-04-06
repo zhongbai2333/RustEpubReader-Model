@@ -1,0 +1,27 @@
+# Training configuration for MacBERT4CSC fine-tuning
+# Used by: scripts/train.py and .github/workflows/train.yml
+
+base_model: "shibing624/macbert4csc-base-chinese"
+max_seq_len: 128
+output_dir: "output/finetuned"
+
+# LoRA configuration
+lora:
+  r: 8
+  alpha: 16
+  dropout: 0.1
+  target_modules:
+    - "query"
+    - "value"
+
+# Training hyperparameters
+training:
+  epochs: 3
+  batch_size: 16
+  learning_rate: 2.0e-4
+  warmup_ratio: 0.1
+  weight_decay: 0.01
+  save_steps: 500
+
+# Minimum samples required to start training
+min_samples: 100

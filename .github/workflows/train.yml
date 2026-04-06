@@ -1,0 +1,194 @@
+# Train Model — Fine-tune with community data (manual trigger)
+#
+# This workflow is triggered manually when enough community data has accumulated.
+# It fine-tunes MacBERT4CSC using LoRA, exports to ONNX, quantizes, and creates a new release.
+#
+# Prerequisites (GitHub Secrets):
+#   - ALIBABA_ACCESS_KEY_ID:     RAM sub-account AccessKey ID (PAI-DLC)
+#   - ALIBABA_ACCESS_KEY_SECRET: RAM sub-account AccessKey Secret
+#   - ALIBABA_REGION:            PAI-DLC region (e.g. cn-shanghai)
+#   - ALIBABA_OSS_BUCKET:        OSS bucket for data/model transfer
+#
+# If PAI-DLC secrets are not configured, training falls back to GitHub Actions runner (CPU, slow).
+
+name: Train Model
+
+on:
+  workflow_dispatch:
+    inputs:
+      use_pai:
+        description: "Use Alibaba PAI-DLC for GPU training"
+        required: true
+        default: true
+        type: boolean
+      version:
+        description: "New model version (e.g. 1.1.0)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  # ─── Count data to decide if training is worthwhile ───
+  check-data:
+    runs-on: ubuntu-latest
+    outputs:
+      sample_count: ${{ steps.count.outputs.count }}
+      should_train: ${{ steps.count.outputs.should_train }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Count samples
+        id: count
+        run: |
+          COUNT=0
+          for f in datasets/base/*.jsonl datasets/submissions/*.jsonl; do
+            if [ -f "$f" ]; then
+              LINES=$(wc -l < "$f")
+              COUNT=$((COUNT + LINES))
+            fi
+          done
+          echo "count=$COUNT" >> "$GITHUB_OUTPUT"
+          echo "Total samples: $COUNT"
+
+          MIN_SAMPLES=100
+          if [ "$COUNT" -ge "$MIN_SAMPLES" ]; then
+            echo "should_train=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "should_train=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::Only $COUNT samples found (minimum $MIN_SAMPLES). Training may not improve the model."
+          fi
+
+  # ─── Local training (GitHub Actions runner, CPU) ───
+  train-local:
+    needs: check-data
+    if: needs.check-data.outputs.should_train == 'true' && inputs.use_pai == false
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Train
+        run: |
+          python scripts/train.py \
+            --config config/training_config.yaml \
+            --data-dir datasets
+
+      - name: Export fine-tuned model to ONNX
+        run: python scripts/export_onnx.py --model output/finetuned/merged --output output
+
+      - name: Quantize
+        run: python scripts/quantize.py --input output/macbert4csc.onnx --output output
+
+      - name: Generate manifest
+        run: python scripts/generate_manifest.py --output output --version "${{ inputs.version }}"
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: "v${{ inputs.version }}"
+          name: "CSC Model v${{ inputs.version }} (fine-tuned)"
+          body: |
+            ## Fine-tuned CSC Model v${{ inputs.version }}
+
+            Training data: ${{ needs.check-data.outputs.sample_count }} samples
+            Method: LoRA fine-tuning on MacBERT4CSC
+            Runner: GitHub Actions (CPU)
+          files: |
+            output/csc-macbert-int8.onnx
+            output/csc-vocab.txt
+            output/csc-manifest.json
+
+  # ─── PAI-DLC GPU training ───
+  train-pai:
+    needs: check-data
+    if: needs.check-data.outputs.should_train == 'true' && inputs.use_pai == true
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install oss2 alibabacloud-pai-dlc20201203
+
+      - name: Upload training data to OSS
+        env:
+          ALIBABA_ACCESS_KEY_ID: ${{ secrets.ALIBABA_ACCESS_KEY_ID }}
+          ALIBABA_ACCESS_KEY_SECRET: ${{ secrets.ALIBABA_ACCESS_KEY_SECRET }}
+          ALIBABA_REGION: ${{ secrets.ALIBABA_REGION }}
+          ALIBABA_OSS_BUCKET: ${{ secrets.ALIBABA_OSS_BUCKET }}
+        run: python scripts/pai_submit.py upload-data --data-dir datasets
+
+      - name: Submit PAI-DLC training job
+        id: submit
+        env:
+          ALIBABA_ACCESS_KEY_ID: ${{ secrets.ALIBABA_ACCESS_KEY_ID }}
+          ALIBABA_ACCESS_KEY_SECRET: ${{ secrets.ALIBABA_ACCESS_KEY_SECRET }}
+          ALIBABA_REGION: ${{ secrets.ALIBABA_REGION }}
+          ALIBABA_OSS_BUCKET: ${{ secrets.ALIBABA_OSS_BUCKET }}
+        run: |
+          JOB_ID=$(python scripts/pai_submit.py submit \
+            --config config/training_config.yaml \
+            --version "${{ inputs.version }}")
+          echo "job_id=$JOB_ID" >> "$GITHUB_OUTPUT"
+          echo "PAI-DLC Job ID: $JOB_ID"
+
+      - name: Wait for PAI-DLC job
+        env:
+          ALIBABA_ACCESS_KEY_ID: ${{ secrets.ALIBABA_ACCESS_KEY_ID }}
+          ALIBABA_ACCESS_KEY_SECRET: ${{ secrets.ALIBABA_ACCESS_KEY_SECRET }}
+          ALIBABA_REGION: ${{ secrets.ALIBABA_REGION }}
+        run: python scripts/pai_submit.py wait --job-id "${{ steps.submit.outputs.job_id }}"
+
+      - name: Download trained model from OSS
+        env:
+          ALIBABA_ACCESS_KEY_ID: ${{ secrets.ALIBABA_ACCESS_KEY_ID }}
+          ALIBABA_ACCESS_KEY_SECRET: ${{ secrets.ALIBABA_ACCESS_KEY_SECRET }}
+          ALIBABA_REGION: ${{ secrets.ALIBABA_REGION }}
+          ALIBABA_OSS_BUCKET: ${{ secrets.ALIBABA_OSS_BUCKET }}
+        run: python scripts/pai_submit.py download-model --output output/finetuned/merged
+
+      - name: Export fine-tuned model to ONNX
+        run: python scripts/export_onnx.py --model output/finetuned/merged --output output
+
+      - name: Quantize
+        run: python scripts/quantize.py --input output/macbert4csc.onnx --output output
+
+      - name: Generate manifest
+        run: python scripts/generate_manifest.py --output output --version "${{ inputs.version }}"
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: "v${{ inputs.version }}"
+          name: "CSC Model v${{ inputs.version }} (fine-tuned, GPU)"
+          body: |
+            ## Fine-tuned CSC Model v${{ inputs.version }}
+
+            Training data: ${{ needs.check-data.outputs.sample_count }} samples
+            Method: LoRA fine-tuning on MacBERT4CSC
+            Runner: Alibaba Cloud PAI-DLC (GPU)
+          files: |
+            output/csc-macbert-int8.onnx
+            output/csc-vocab.txt
+            output/csc-manifest.json

@@ -1,0 +1,76 @@
+# Validate PR — Check community-submitted correction data
+#
+# Triggered when PRs modify files under datasets/submissions/
+
+name: Validate PR
+
+on:
+  pull_request:
+    paths:
+      - "datasets/submissions/**"
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout PR
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Find changed submission files
+        id: changed
+        run: |
+          FILES=$(git diff --name-only --diff-filter=ACMR origin/${{ github.base_ref }}...HEAD -- 'datasets/submissions/*.jsonl')
+          if [ -z "$FILES" ]; then
+            echo "No .jsonl files changed in datasets/submissions/"
+            echo "files=" >> "$GITHUB_OUTPUT"
+          else
+            echo "Changed files:"
+            echo "$FILES"
+            echo "files<<EOF" >> "$GITHUB_OUTPUT"
+            echo "$FILES" >> "$GITHUB_OUTPUT"
+            echo "EOF" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Validate submissions
+        if: steps.changed.outputs.files != ''
+        run: |
+          echo "${{ steps.changed.outputs.files }}" | tr '\n' ' ' | xargs python scripts/validate_submissions.py
+
+      - name: Check for path traversal or suspicious files
+        run: |
+          # Ensure PR only modifies datasets/submissions/ directory
+          CHANGED=$(git diff --name-only --diff-filter=ACMR origin/${{ github.base_ref }}...HEAD)
+          echo "All changed files:"
+          echo "$CHANGED"
+
+          DISALLOWED=$(echo "$CHANGED" | grep -v '^datasets/submissions/' || true)
+          if [ -n "$DISALLOWED" ]; then
+            echo "::error::PR modifies files outside datasets/submissions/:"
+            echo "$DISALLOWED"
+            echo ""
+            echo "Data contribution PRs should only add files to datasets/submissions/"
+            exit 1
+          fi
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "## Data Submission Validation" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          if [ -n "${{ steps.changed.outputs.files }}" ]; then
+            echo "### Validated files:" >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            echo "${{ steps.changed.outputs.files }}" >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "No .jsonl submission files changed." >> "$GITHUB_STEP_SUMMARY"
+          fi

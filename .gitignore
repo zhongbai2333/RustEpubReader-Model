@@ -168,6 +168,16 @@ cython_debug/
 #.idea/
 
 # Ruff stuff:
+
+# Model artifacts (not committed, released via GitHub Releases)
+*.onnx
+*.bin
+*.pt
+*.pth
+*.safetensors
+output/
+checkpoints/
+wandb/
 .ruff_cache/
 
 # PyPI configuration file
