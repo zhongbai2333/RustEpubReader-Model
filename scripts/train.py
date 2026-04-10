@@ -1,3 +1,4 @@
+# 文件职责：使用 LoRA 微调 MacBERT4CSC 纠错模型的训练脚本。
 """
 Fine-tune MacBERT4CSC with LoRA using community-contributed correction data.
 

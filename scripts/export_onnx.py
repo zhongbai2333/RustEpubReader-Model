@@ -1,3 +1,4 @@
+# 文件职责：将 HuggingFace MacBERT4CSC 模型导出为 ONNX 格式。
 """
 Export MacBERT4CSC model from HuggingFace to ONNX format.
 

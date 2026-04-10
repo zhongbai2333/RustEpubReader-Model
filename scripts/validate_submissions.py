@@ -1,3 +1,4 @@
+# 文件职责：验证社区提交的纠错数据文件的格式与内容质量。
 """
 Validate community-submitted correction data files.
 

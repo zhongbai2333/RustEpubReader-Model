@@ -1,3 +1,4 @@
+# 文件职责：阿里云 PAI-DLC 训练任务的提交、监控与模型下载辅助脚本。
 """
 PAI-DLC training job submission and monitoring helper.
 

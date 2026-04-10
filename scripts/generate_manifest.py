@@ -1,3 +1,4 @@
+# 文件职责：为模型产物生成包含版本信息和 SHA256 校验的清单文件。
 """
 Generate manifest.json with version info and SHA256 checksums for all model artifacts.
 

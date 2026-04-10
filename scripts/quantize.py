@@ -1,3 +1,4 @@
+# 文件职责：将 ONNX 模型进行 INT8 动态量化以减小体积。
 """
 Quantize ONNX model to INT8 (dynamic quantization).
 
