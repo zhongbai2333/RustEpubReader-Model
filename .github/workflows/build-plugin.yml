@@ -1,0 +1,321 @@
+# Build CSC Plugin — cross-compile the inference plugin for every platform
+# the host application supports, plus extract the matching ONNX Runtime
+# native libraries. All artifacts are uploaded to the GitHub Release that
+# the model CDN mirrors.
+#
+# Triggered by:
+#   - Pushing a tag matching `plugin-v*`
+#   - Manual dispatch (with optional version override)
+#
+# Naming convention for the per-platform directory in the Release zip:
+#   windows-x86_64-cpu       csc_plugin.dll
+#   windows-x86_64-directml  csc_plugin.dll  (DirectML EP enabled)
+#   windows-aarch64-cpu      csc_plugin.dll
+#   linux-x86_64             libcsc_plugin.so
+#   linux-aarch64            libcsc_plugin.so
+#   macos-x86_64             libcsc_plugin.dylib
+#   macos-aarch64            libcsc_plugin.dylib
+#   android-arm64-v8a        libonnxruntime.so + libonnxruntime4j_jni.so
+#   android-x86_64           libonnxruntime.so + libonnxruntime4j_jni.so
+#
+# The Android variant ships only the runtime shared libs — the actual
+# inference is performed by the existing onnxruntime-android Java bindings
+# already on the classpath.
+
+name: Build CSC Plugin
+
+on:
+  push:
+    tags:
+      - "plugin-v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Plugin version (e.g. 1.0.0). Defaults to tag name."
+        required: false
+        type: string
+      ort_android_version:
+        description: "onnxruntime-android version to extract"
+        required: false
+        default: "1.24.3"
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  PLUGIN_DIR: plugins
+  OUTPUT_ROOT: output/plugins/v1
+
+jobs:
+  # ---------------------------------------------------------------------
+  # Per-platform plugin builds (one matrix entry per output directory).
+  # ---------------------------------------------------------------------
+  build-plugin:
+    name: ${{ matrix.label }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: windows-x86_64-cpu
+            runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            features: ""
+            artifact: csc_plugin.dll
+          - label: windows-x86_64-directml
+            runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            features: directml
+            artifact: csc_plugin.dll
+          - label: windows-aarch64-cpu
+            runner: windows-latest
+            target: aarch64-pc-windows-msvc
+            features: ""
+            artifact: csc_plugin.dll
+          - label: linux-x86_64
+            runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            features: ""
+            artifact: libcsc_plugin.so
+          - label: linux-aarch64
+            runner: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            features: ""
+            artifact: libcsc_plugin.so
+            cross: true
+          - label: macos-x86_64
+            runner: macos-13
+            target: x86_64-apple-darwin
+            features: ""
+            artifact: libcsc_plugin.dylib
+          - label: macos-aarch64
+            runner: macos-latest
+            target: aarch64-apple-darwin
+            features: ""
+            artifact: libcsc_plugin.dylib
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross-compile linker (linux-aarch64)
+        if: matrix.cross == true
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: Configure cross linker (linux-aarch64)
+        if: matrix.cross == true
+        shell: bash
+        run: |
+          mkdir -p ~/.cargo
+          {
+            echo "[target.aarch64-unknown-linux-gnu]"
+            echo "linker = \"aarch64-linux-gnu-gcc\""
+          } >> ~/.cargo/config.toml
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ${{ env.PLUGIN_DIR }}/target
+          key: ${{ runner.os }}-${{ matrix.target }}-${{ matrix.features }}-${{ hashFiles(format('{0}/**/Cargo.toml', env.PLUGIN_DIR), format('{0}/**/Cargo.lock', env.PLUGIN_DIR)) }}
+          restore-keys: |
+            ${{ runner.os }}-${{ matrix.target }}-
+
+      - name: Build plugin
+        shell: bash
+        working-directory: ${{ env.PLUGIN_DIR }}
+        run: |
+          set -euo pipefail
+          FEATURES="${{ matrix.features }}"
+          if [ -n "$FEATURES" ]; then
+            cargo build --release -p csc-plugin --target ${{ matrix.target }} --features "$FEATURES"
+          else
+            cargo build --release -p csc-plugin --target ${{ matrix.target }}
+          fi
+
+      - name: Stage artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          DEST="${OUTPUT_ROOT}/${{ matrix.label }}"
+          mkdir -p "$DEST"
+          cp "${PLUGIN_DIR}/target/${{ matrix.target }}/release/${{ matrix.artifact }}" "$DEST/${{ matrix.artifact }}"
+          ls -la "$DEST"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: plugin-${{ matrix.label }}
+          path: ${{ env.OUTPUT_ROOT }}/${{ matrix.label }}/
+          retention-days: 7
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------
+  # Android variant: download the official ORT AAR and extract only the
+  # `.so` files we need. Much cheaper than building from source.
+  # ---------------------------------------------------------------------
+  extract-android-libs:
+    name: extract-android-libs
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Determine ORT version
+        id: ort
+        shell: bash
+        run: |
+          V="${{ inputs.ort_android_version }}"
+          if [ -z "$V" ]; then V="1.24.3"; fi
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+
+      - name: Run extractor
+        run: |
+          python scripts/extract_onnxruntime_android.py \
+            --version "${{ steps.ort.outputs.version }}" \
+            --output "${OUTPUT_ROOT}"
+
+      - name: Upload android-arm64-v8a
+        uses: actions/upload-artifact@v4
+        with:
+          name: plugin-android-arm64-v8a
+          path: ${{ env.OUTPUT_ROOT }}/android-arm64-v8a/
+          if-no-files-found: error
+
+      - name: Upload android-x86_64
+        uses: actions/upload-artifact@v4
+        with:
+          name: plugin-android-x86_64
+          path: ${{ env.OUTPUT_ROOT }}/android-x86_64/
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------
+  # Aggregate all per-platform artifacts, generate manifests and create
+  # the GitHub Release that the CDN syncs from.
+  # ---------------------------------------------------------------------
+  release:
+    name: Publish Release
+    needs: [build-plugin, extract-android-libs]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Determine version
+        id: version
+        shell: bash
+        run: |
+          if [ -n "${{ inputs.version }}" ]; then
+            echo "version=${{ inputs.version }}" >> "$GITHUB_OUTPUT"
+          elif [[ "${{ github.ref }}" == refs/tags/plugin-v* ]]; then
+            TAG="${{ github.ref_name }}"
+            echo "version=${TAG#plugin-v}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=$(date +%Y%m%d)" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Download all platform artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: ${{ env.OUTPUT_ROOT }}
+          pattern: plugin-*
+          merge-multiple: false
+
+      - name: Flatten artifact layout
+        shell: bash
+        run: |
+          set -euo pipefail
+          # download-artifact creates `plugin-<label>/<files>` — rename each to
+          # the bare label so the final tree matches the CDN layout.
+          cd "${OUTPUT_ROOT}"
+          for d in plugin-*/; do
+            label="${d#plugin-}"
+            label="${label%/}"
+            mv "$d" "$label"
+          done
+          find . -maxdepth 2 -type f | sort
+
+      - name: Generate manifests
+        run: |
+          python scripts/generate_plugin_manifest.py \
+            --root "${OUTPUT_ROOT}" \
+            --version "${{ steps.version.outputs.version }}" \
+            --abi 1
+
+      - name: Pack per-platform tarballs
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cd "${OUTPUT_ROOT}"
+          for label in */; do
+            label="${label%/}"
+            tar czf "../../dist/csc-plugin-${{ steps.version.outputs.version }}-${label}.tar.gz" "$label"
+          done
+          ls -la ../../dist
+
+      - name: Print SHA256 summary
+        shell: bash
+        run: |
+          {
+            echo "## CSC Plugin v${{ steps.version.outputs.version }} (ABI 1)"
+            echo ""
+            echo '```'
+            ( cd dist && sha256sum * )
+            echo '```'
+            echo ""
+            for m in "${OUTPUT_ROOT}"/*/csc-plugin-manifest.json; do
+              echo "### $(basename "$(dirname "$m")")"
+              echo '```json'
+              cat "$m"
+              echo
+              echo '```'
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/plugin-v') || github.event_name == 'workflow_dispatch'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name || format('plugin-v{0}', steps.version.outputs.version) }}
+          name: "CSC Plugin v${{ steps.version.outputs.version }}"
+          body: |
+            ## CSC Inference Plugin v${{ steps.version.outputs.version }}
+
+            C ABI version: **1**
+
+            Per-platform tarballs are layout-equivalent to
+            `https://dl.zhongbai233.com/plugins/v1/<platform>/`.
+
+            Each tarball contains the plugin shared library (or, for Android,
+            the bundled ONNX Runtime native libs) plus a `csc-plugin-manifest.json`
+            with SHA256 checksums for runtime verification.
+          files: |
+            dist/*.tar.gz
+          draft: false
+          prerelease: false

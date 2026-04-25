@@ -12,15 +12,24 @@ import shutil
 from pathlib import Path
 
 import torch
+import yaml
 from transformers import AutoTokenizer, AutoModelForMaskedLM
 
 
 DEFAULT_MODEL = "shibing624/macbert4csc-base-chinese"
 DEFAULT_OUTPUT = "output"
-MAX_SEQ_LEN = 128
+DEFAULT_CONFIG = "config/training_config.yaml"
 
 
-def export_onnx(model_name: str, output_dir: str):
+def load_config(config_path: str) -> dict:
+    path = Path(config_path)
+    if not path.exists():
+        return {}
+    with open(path, encoding="utf-8") as f:
+        return yaml.safe_load(f) or {}
+
+
+def export_onnx(model_name: str, output_dir: str, max_seq_len: int):
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
 
@@ -51,7 +60,7 @@ def export_onnx(model_name: str, output_dir: str):
         return_tensors="pt",
         padding="max_length",
         truncation=True,
-        max_length=MAX_SEQ_LEN,
+        max_length=max_seq_len,
     )
 
     onnx_path = output_path / "macbert4csc.onnx"
@@ -84,11 +93,18 @@ def export_onnx(model_name: str, output_dir: str):
 
 def main():
     parser = argparse.ArgumentParser(description="Export MacBERT4CSC to ONNX")
-    parser.add_argument("--model", default=DEFAULT_MODEL, help="HuggingFace model name")
-    parser.add_argument("--output", default=DEFAULT_OUTPUT, help="Output directory")
+    parser.add_argument("--config", default=DEFAULT_CONFIG, help="Training config file")
+    parser.add_argument("--model", default=None, help="HuggingFace model name")
+    parser.add_argument("--output", default=None, help="Output directory")
+    parser.add_argument("--max-seq-len", type=int, default=None, help="Maximum sequence length")
     args = parser.parse_args()
 
-    export_onnx(args.model, args.output)
+    config = load_config(args.config)
+    model_name = args.model or config.get("base_model", DEFAULT_MODEL)
+    output_dir = args.output or DEFAULT_OUTPUT
+    max_seq_len = args.max_seq_len or config.get("max_seq_len", 128)
+
+    export_onnx(model_name, output_dir, max_seq_len)
 
 
 if __name__ == "__main__":

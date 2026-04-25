@@ -89,6 +89,7 @@ def train(config_path: str, data_dir: str):
 
     model_name = config.get("base_model", "shibing624/macbert4csc-base-chinese")
     max_len = config.get("max_seq_len", 128)
+    min_samples = config.get("min_samples", 100)
     output_dir = config.get("output_dir", "output/finetuned")
 
     # LoRA config
@@ -129,6 +130,12 @@ def train(config_path: str, data_dir: str):
 
     if len(records) == 0:
         print("No training data found. Exiting.")
+        return
+
+    if len(records) < min_samples:
+        print(
+            f"Not enough training data. Need at least {min_samples} samples, got {len(records)}. Exiting."
+        )
         return
 
     dataset = prepare_dataset(records, tokenizer, max_len)

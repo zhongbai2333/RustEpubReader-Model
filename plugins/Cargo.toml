@@ -1,0 +1,12 @@
+[workspace]
+resolver = "2"
+members = ["csc-plugin"]
+
+[profile.release]
+# Plugin is downloaded on demand — keep it small.
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+strip = "symbols"
+panic = "abort"
+incremental = false

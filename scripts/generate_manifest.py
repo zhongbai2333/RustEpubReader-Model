@@ -12,13 +12,24 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 
+import yaml
+
 
 DEFAULT_OUTPUT = "output"
+DEFAULT_CONFIG = "config/training_config.yaml"
 
 FILES = [
     "csc-macbert-int8.onnx",
     "csc-vocab.txt",
 ]
+
+
+def load_config(config_path: str) -> dict:
+    path = Path(config_path)
+    if not path.exists():
+        return {}
+    with open(path, encoding="utf-8") as f:
+        return yaml.safe_load(f) or {}
 
 
 def sha256_file(path: Path) -> str:
@@ -29,7 +40,7 @@ def sha256_file(path: Path) -> str:
     return h.hexdigest()
 
 
-def generate_manifest(output_dir: str, version: str):
+def generate_manifest(output_dir: str, version: str, base_model: str, max_seq_len: int):
     output_path = Path(output_dir)
 
     files_info = []
@@ -53,9 +64,9 @@ def generate_manifest(output_dir: str, version: str):
     manifest = {
         "version": version,
         "created_at": datetime.now(timezone.utc).isoformat(),
-        "base_model": "shibing624/macbert4csc-base-chinese",
+        "base_model": base_model,
         "quantization": "dynamic_int8",
-        "max_seq_len": 128,
+        "max_seq_len": max_seq_len,
         "files": files_info,
     }
 
@@ -71,11 +82,16 @@ def generate_manifest(output_dir: str, version: str):
 
 def main():
     parser = argparse.ArgumentParser(description="Generate model manifest")
+    parser.add_argument("--config", default=DEFAULT_CONFIG, help="Training config file")
     parser.add_argument("--output", default=DEFAULT_OUTPUT, help="Output directory")
     parser.add_argument("--version", default="1.0.0", help="Model version string")
     args = parser.parse_args()
 
-    generate_manifest(args.output, args.version)
+    config = load_config(args.config)
+    base_model = config.get("base_model", "shibing624/macbert4csc-base-chinese")
+    max_seq_len = config.get("max_seq_len", 128)
+
+    generate_manifest(args.output, args.version, base_model, max_seq_len)
 
 
 if __name__ == "__main__":
