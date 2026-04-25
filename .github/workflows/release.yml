@@ -1,38 +1,41 @@
-# Build CSC Plugin — cross-compile the inference plugin for every platform
-# the host application supports, plus extract the matching ONNX Runtime
-# native libraries. All artifacts are uploaded to the GitHub Release that
-# the model CDN mirrors.
+# Release — build the CSC ONNX model + cross-compile the inference plugin
+# for every supported platform and publish them in a single GitHub Release.
+#
+# A single tag (e.g. `v0.1.0`) drives everything; the model and plugin
+# versions are intentionally kept in lock-step so the CDN layout under
+# `https://dl.zhongbai233.com/{models,plugins/v1}/...` stays consistent.
 #
 # Triggered by:
-#   - Pushing a tag matching `plugin-v*`
+#   - Pushing a tag matching `v*`
 #   - Manual dispatch (with optional version override)
 #
-# Naming convention for the per-platform directory in the Release zip:
+# Per-platform plugin directory layout:
 #   windows-x86_64-cpu       csc_plugin.dll
 #   windows-x86_64-directml  csc_plugin.dll  (DirectML EP enabled)
 #   windows-aarch64-cpu      csc_plugin.dll
 #   linux-x86_64             libcsc_plugin.so
-#   linux-aarch64            libcsc_plugin.so
-#   macos-x86_64             libcsc_plugin.dylib
+#   linux-aarch64            libcsc_plugin.so   (cross-compiled)
+#   macos-x86_64             libcsc_plugin.dylib (cross-compiled on arm64 runner)
 #   macos-aarch64            libcsc_plugin.dylib
 #   android-arm64-v8a        libonnxruntime.so + libonnxruntime4j_jni.so
 #   android-x86_64           libonnxruntime.so + libonnxruntime4j_jni.so
-#
-# The Android variant ships only the runtime shared libs — the actual
-# inference is performed by the existing onnxruntime-android Java bindings
-# already on the classpath.
 
-name: Build CSC Plugin
+name: Release
 
 on:
   push:
     tags:
-      - "plugin-v*"
+      - "v*"
   workflow_dispatch:
     inputs:
       version:
-        description: "Plugin version (e.g. 1.0.0). Defaults to tag name."
+        description: "Release version (e.g. 1.0.0). Defaults to tag name."
         required: false
+        type: string
+      model_name:
+        description: "HuggingFace model to export"
+        required: false
+        default: "shibing624/macbert4csc-base-chinese"
         type: string
       ort_android_version:
         description: "onnxruntime-android version to extract"
@@ -51,10 +54,104 @@ env:
 
 jobs:
   # ---------------------------------------------------------------------
+  # Resolve the version once so every downstream job uses the same value.
+  # ---------------------------------------------------------------------
+  setup:
+    name: Resolve version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      model_name: ${{ steps.model.outputs.name }}
+      ort_android_version: ${{ steps.ort.outputs.version }}
+    steps:
+      - name: Determine version
+        id: version
+        shell: bash
+        run: |
+          if [ -n "${{ inputs.version }}" ]; then
+            echo "version=${{ inputs.version }}" >> "$GITHUB_OUTPUT"
+          elif [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            TAG="${{ github.ref_name }}"
+            echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=$(date +%Y%m%d)" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Determine model name
+        id: model
+        shell: bash
+        run: |
+          MODEL="${{ inputs.model_name }}"
+          if [ -z "$MODEL" ]; then MODEL="shibing624/macbert4csc-base-chinese"; fi
+          echo "name=$MODEL" >> "$GITHUB_OUTPUT"
+
+      - name: Determine ORT (Android) version
+        id: ort
+        shell: bash
+        run: |
+          V="${{ inputs.ort_android_version }}"
+          if [ -z "$V" ]; then V="1.24.3"; fi
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+
+  # ---------------------------------------------------------------------
+  # Export MacBERT4CSC → ONNX, quantize to INT8, emit manifest.
+  # ---------------------------------------------------------------------
+  build-model:
+    name: Build model
+    needs: setup
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Export ONNX
+        run: python scripts/export_onnx.py --model "${{ needs.setup.outputs.model_name }}" --output output
+
+      - name: Quantize to INT8
+        run: python scripts/quantize.py --input output/macbert4csc.onnx --output output
+
+      - name: Generate manifest
+        run: python scripts/generate_manifest.py --output output --version "${{ needs.setup.outputs.version }}"
+
+      - name: Print SHA256
+        shell: bash
+        run: |
+          {
+            echo "## Model Artifacts"
+            echo ""
+            echo '```'
+            sha256sum output/csc-macbert-int8.onnx output/csc-vocab.txt output/csc-manifest.json
+            echo '```'
+            echo ""
+            cat output/csc-manifest.json
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload model artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: model-${{ needs.setup.outputs.version }}
+          path: |
+            output/csc-macbert-int8.onnx
+            output/csc-vocab.txt
+            output/csc-manifest.json
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------
   # Per-platform plugin builds (one matrix entry per output directory).
   # ---------------------------------------------------------------------
   build-plugin:
-    name: ${{ matrix.label }}
+    name: plugin-${{ matrix.label }}
+    needs: setup
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
     strategy:
@@ -97,7 +194,6 @@ jobs:
             target: aarch64-apple-darwin
             features: ""
             artifact: libcsc_plugin.dylib
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -168,7 +264,8 @@ jobs:
   # `.so` files we need. Much cheaper than building from source.
   # ---------------------------------------------------------------------
   extract-android-libs:
-    name: extract-android-libs
+    name: plugin-android-extract
+    needs: setup
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -180,18 +277,10 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Determine ORT version
-        id: ort
-        shell: bash
-        run: |
-          V="${{ inputs.ort_android_version }}"
-          if [ -z "$V" ]; then V="1.24.3"; fi
-          echo "version=$V" >> "$GITHUB_OUTPUT"
-
       - name: Run extractor
         run: |
           python scripts/extract_onnxruntime_android.py \
-            --version "${{ steps.ort.outputs.version }}" \
+            --version "${{ needs.setup.outputs.ort_android_version }}" \
             --output "${OUTPUT_ROOT}"
 
       - name: Upload android-arm64-v8a
@@ -209,12 +298,11 @@ jobs:
           if-no-files-found: error
 
   # ---------------------------------------------------------------------
-  # Aggregate all per-platform artifacts, generate manifests and create
-  # the GitHub Release that the CDN syncs from.
+  # Aggregate all artifacts and publish a single GitHub Release.
   # ---------------------------------------------------------------------
   release:
     name: Publish Release
-    needs: [build-plugin, extract-android-libs]
+    needs: [setup, build-model, build-plugin, extract-android-libs]
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -226,32 +314,26 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Determine version
-        id: version
-        shell: bash
-        run: |
-          if [ -n "${{ inputs.version }}" ]; then
-            echo "version=${{ inputs.version }}" >> "$GITHUB_OUTPUT"
-          elif [[ "${{ github.ref }}" == refs/tags/plugin-v* ]]; then
-            TAG="${{ github.ref_name }}"
-            echo "version=${TAG#plugin-v}" >> "$GITHUB_OUTPUT"
-          else
-            echo "version=$(date +%Y%m%d)" >> "$GITHUB_OUTPUT"
-          fi
+      - name: Download model artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: model-staging
+          pattern: model-*
+          merge-multiple: true
 
-      - name: Download all platform artifacts
+      - name: Download plugin artifacts
         uses: actions/download-artifact@v4
         with:
           path: ${{ env.OUTPUT_ROOT }}
           pattern: plugin-*
           merge-multiple: false
 
-      - name: Flatten artifact layout
+      - name: Flatten plugin layout
         shell: bash
         run: |
           set -euo pipefail
-          # download-artifact creates `plugin-<label>/<files>` — rename each to
-          # the bare label so the final tree matches the CDN layout.
+          # download-artifact creates `plugin-<label>/<files>` — rename each
+          # to the bare label so the final tree matches the CDN layout.
           cd "${OUTPUT_ROOT}"
           for d in plugin-*/; do
             label="${d#plugin-}"
@@ -260,11 +342,11 @@ jobs:
           done
           find . -maxdepth 2 -type f | sort
 
-      - name: Generate manifests
+      - name: Generate plugin manifests
         run: |
           python scripts/generate_plugin_manifest.py \
             --root "${OUTPUT_ROOT}" \
-            --version "${{ steps.version.outputs.version }}" \
+            --version "${{ needs.setup.outputs.version }}" \
             --abi 1
 
       - name: Pack per-platform tarballs
@@ -275,47 +357,91 @@ jobs:
           cd "${OUTPUT_ROOT}"
           for label in */; do
             label="${label%/}"
-            tar czf "../../dist/csc-plugin-${{ steps.version.outputs.version }}-${label}.tar.gz" "$label"
+            tar czf "../../dist/csc-plugin-${{ needs.setup.outputs.version }}-${label}.tar.gz" "$label"
           done
           ls -la ../../dist
 
-      - name: Print SHA256 summary
+      - name: Stage model files for release
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp model-staging/csc-macbert-int8.onnx dist/
+          cp model-staging/csc-vocab.txt dist/
+          cp model-staging/csc-manifest.json dist/
+          ls -la dist
+
+      - name: Print release summary
         shell: bash
         run: |
           {
-            echo "## CSC Plugin v${{ steps.version.outputs.version }} (ABI 1)"
+            echo "## RustEpubReader Resources v${{ needs.setup.outputs.version }}"
             echo ""
+            echo "### Plugin (ABI 1) tarballs"
             echo '```'
-            ( cd dist && sha256sum * )
+            ( cd dist && sha256sum csc-plugin-*.tar.gz )
+            echo '```'
+            echo ""
+            echo "### Model files"
+            echo '```'
+            ( cd dist && sha256sum csc-macbert-int8.onnx csc-vocab.txt csc-manifest.json )
             echo '```'
             echo ""
             for m in "${OUTPUT_ROOT}"/*/csc-plugin-manifest.json; do
-              echo "### $(basename "$(dirname "$m")")"
+              echo "### plugin/$(basename "$(dirname "$m")")"
               echo '```json'
-              cat "$m"
-              echo
+              cat "$m"; echo
               echo '```'
             done
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Create GitHub Release
-        if: startsWith(github.ref, 'refs/tags/plugin-v') || github.event_name == 'workflow_dispatch'
+        if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.ref_name || format('plugin-v{0}', steps.version.outputs.version) }}
-          name: "CSC Plugin v${{ steps.version.outputs.version }}"
+          tag_name: ${{ github.ref_name || format('v{0}', needs.setup.outputs.version) }}
+          name: "RustEpubReader Resources v${{ needs.setup.outputs.version }}"
           body: |
-            ## CSC Inference Plugin v${{ steps.version.outputs.version }}
+            # RustEpubReader Resources v${{ needs.setup.outputs.version }}
 
-            C ABI version: **1**
+            Unified release of the Chinese spelling-correction model and the
+            cross-platform inference plugin. The model and plugin versions
+            are kept in lock-step so the CDN layout under
+            `https://dl.zhongbai233.com/{models,plugins/v1}/...` stays
+            consistent.
+
+            ## Model
+
+            Base model: `${{ needs.setup.outputs.model_name }}`
+            Quantization: Dynamic INT8
+
+            | File | Description |
+            |---|---|
+            | `csc-macbert-int8.onnx` | Quantized ONNX model |
+            | `csc-vocab.txt` | BERT WordPiece vocabulary |
+            | `csc-manifest.json` | Version manifest with SHA256 checksums |
+
+            CDN URLs (after sync):
+
+            ```
+            https://dl.zhongbai233.com/models/csc-macbert-int8.onnx
+            https://dl.zhongbai233.com/models/csc-vocab.txt
+            https://dl.zhongbai233.com/models/csc-manifest.json
+            ```
+
+            ## Plugin (C ABI 1)
 
             Per-platform tarballs are layout-equivalent to
             `https://dl.zhongbai233.com/plugins/v1/<platform>/`.
 
-            Each tarball contains the plugin shared library (or, for Android,
-            the bundled ONNX Runtime native libs) plus a `csc-plugin-manifest.json`
-            with SHA256 checksums for runtime verification.
+            Each tarball contains the plugin shared library (or, for
+            Android, the bundled ONNX Runtime native libs) plus a
+            `csc-plugin-manifest.json` with SHA256 checksums for runtime
+            verification.
           files: |
-            dist/*.tar.gz
+            dist/csc-macbert-int8.onnx
+            dist/csc-vocab.txt
+            dist/csc-manifest.json
+            dist/csc-plugin-*.tar.gz
           draft: false
           prerelease: false
