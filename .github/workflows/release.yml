@@ -354,12 +354,13 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p dist
+          DIST_ABS="$(cd dist && pwd)"
           cd "${OUTPUT_ROOT}"
           for label in */; do
             label="${label%/}"
-            tar czf "../../dist/csc-plugin-${{ needs.setup.outputs.version }}-${label}.tar.gz" "$label"
+            tar czf "${DIST_ABS}/csc-plugin-${{ needs.setup.outputs.version }}-${label}.tar.gz" "$label"
           done
-          ls -la ../../dist
+          ls -la "${DIST_ABS}"
 
       - name: Stage model files for release
         shell: bash
