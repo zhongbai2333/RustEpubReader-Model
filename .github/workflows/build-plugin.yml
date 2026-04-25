@@ -88,7 +88,7 @@ jobs:
             artifact: libcsc_plugin.so
             cross: true
           - label: macos-x86_64
-            runner: macos-13
+            runner: macos-latest
             target: x86_64-apple-darwin
             features: ""
             artifact: libcsc_plugin.dylib
