@@ -395,6 +395,28 @@ jobs:
           done
           ls -la "${DIST_ABS}"
 
+      - name: Stage individual plugin files for CDN
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The CDN worker maps `/plugins/v1/<platform>/<filename>` to
+          # release asset `<platform>--<filename>`. Upload one asset per
+          # actual file so the worker can serve them directly without
+          # having to unpack tarballs.
+          mkdir -p dist
+          DIST_ABS="$(cd dist && pwd)"
+          cd "${OUTPUT_ROOT}"
+          for label in */; do
+            label="${label%/}"
+            for f in "$label"/*; do
+              [ -f "$f" ] || continue
+              name="$(basename "$f")"
+              cp "$f" "${DIST_ABS}/${label}--${name}"
+            done
+          done
+          cd "${DIST_ABS}"
+          ls -la *--*
+
       - name: Stage model files for release
         shell: bash
         run: |
@@ -477,5 +499,6 @@ jobs:
             dist/csc-vocab.txt
             dist/csc-manifest.json
             dist/csc-plugin-*.tar.gz
+            dist/*--*
           draft: false
           prerelease: false
