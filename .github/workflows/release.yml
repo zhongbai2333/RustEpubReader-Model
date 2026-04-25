@@ -61,21 +61,54 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
       model_name: ${{ steps.model.outputs.name }}
       ort_android_version: ${{ steps.ort.outputs.version }}
     steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
       - name: Determine version
         id: version
         shell: bash
         run: |
-          if [ -n "${{ inputs.version }}" ]; then
-            echo "version=${{ inputs.version }}" >> "$GITHUB_OUTPUT"
-          elif [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+          set -euo pipefail
+          if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
             TAG="${{ github.ref_name }}"
-            echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+            VERSION="${TAG#v}"
+          elif [ -n "${{ inputs.version }}" ]; then
+            VERSION="${{ inputs.version }}"
+            TAG="v${VERSION}"
           else
-            echo "version=$(date +%Y%m%d)" >> "$GITHUB_OUTPUT"
+            VERSION="$(date +%Y%m%d)"
+            TAG="v${VERSION}"
           fi
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "Resolved version=${VERSION} tag=${TAG}"
+
+      - name: Create tag (workflow_dispatch only)
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.version.outputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Refuse to silently re-use an existing tag — that's exactly
+          # what overwrote v0.1.0 last time.
+          if git rev-parse --verify --quiet "refs/tags/${TAG}" >/dev/null; then
+            echo "::error::Tag ${TAG} already exists. Bump the version input or delete the tag."
+            exit 1
+          fi
+          if gh api "repos/${{ github.repository }}/git/refs/tags/${TAG}" >/dev/null 2>&1; then
+            echo "::error::Remote tag ${TAG} already exists. Bump the version input or delete the tag."
+            exit 1
+          fi
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "${TAG}" -m "Release ${TAG}"
+          git push origin "${TAG}"
 
       - name: Determine model name
         id: model
@@ -400,8 +433,8 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.ref_name || format('v{0}', needs.setup.outputs.version) }}
-          name: "RustEpubReader Resources v${{ needs.setup.outputs.version }}"
+          tag_name: ${{ needs.setup.outputs.tag }}
+          name: "RustEpubReader Resources ${{ needs.setup.outputs.tag }}"
           body: |
             # RustEpubReader Resources v${{ needs.setup.outputs.version }}
 
